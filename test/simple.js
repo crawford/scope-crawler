@@ -9,7 +9,7 @@ function multiply(x, y) {
 class Test {
     do_thing(a, b) {
 	function inner() {
-	    add(a,b)
+	    multiply(a,b)
 	}
 	inner()
     }
