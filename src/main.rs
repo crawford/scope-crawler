@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
+use stack_graphs::graph::StackGraph;
 use std::path::{Path, PathBuf};
-use tree_sitter::{Node, Point, Query, QueryCursor};
+use tree_sitter::{Node, Point};
+use tree_sitter_stack_graphs::NoCancellation;
+use tree_sitter_stack_graphs::Variables;
 
 #[derive(clap::Parser)]
 struct Options {
@@ -11,18 +14,27 @@ struct Options {
     verbosity: u8,
 }
 
-fn main() {
+fn main() -> Result<()> {
     use clap::Parser;
 
     let options = Options::parse();
 
+    fn filter(v: u8) -> log::LevelFilter {
+        use log::LevelFilter::*;
+        match v {
+            0 => Warn,
+            1 => Info,
+            2 => Debug,
+            _ => Trace,
+        }
+    }
+
     pretty_env_logger::formatted_builder()
-        .filter_level(match options.verbosity {
-            0 => log::LevelFilter::Warn,
-            1 => log::LevelFilter::Info,
-            2 => log::LevelFilter::Debug,
-            _ => log::LevelFilter::Trace,
-        })
+        .filter_level(filter(options.verbosity))
+        .filter_module(
+            "tree_sitter_graph",
+            filter(options.verbosity.saturating_sub(1)),
+        )
         .try_init()
         .expect("initializing logging");
 
@@ -35,13 +47,16 @@ fn main() {
         };
     }
 
-    let source = SourceCode::from_path(&options.file).expect("Failed to read file");
+    let source = SourceCode::from_path(&options.file)
+        .context(anyhow::anyhow!("reading {}", options.file.display()))?;
     let ident = source.build_identifier(row!(options.line));
 
     println!("'{ident}' called by:");
-    for (point, source, caller) in source.callers(&ident) {
+    for (point, source, caller) in source.callers(&ident).context("getting callers")? {
         println!("- '{caller}' @ {}:{}", source.path.display(), point.row);
     }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -80,14 +95,36 @@ impl std::fmt::Display for Identifier<'_> {
 struct SourceCode<'a> {
     path: &'a Path,
     source: String,
+    graph: StackGraph,
 }
 
 impl<'a> SourceCode<'a> {
     fn from_path(path: &'a Path) -> Result<SourceCode<'a>> {
-        Ok(SourceCode {
+        let mut code = SourceCode {
             path,
             source: std::fs::read_to_string(path).context("opening {path}")?,
-        })
+            graph: StackGraph::new(),
+        };
+
+        // XXX: Why does this line panic?
+        let language = tree_sitter_stack_graphs_javascript::language_configuration(&NoCancellation);
+        // let mut graph = StackGraph::new();
+        // let file = graph
+        //     .add_file(&path.to_string_lossy())
+        //     .expect("file not present in empty graph");
+        // let globals = Variables::new();
+        // language
+        //     .sgl
+        //     .build_stack_graph_into(
+        //         &mut code.graph,
+        //         file,
+        //         &code.source,
+        //         &globals,
+        //         &NoCancellation,
+        //     )
+        //     .context("building stack graph")?;
+
+        Ok(code)
     }
 
     fn build_identifier(&'a self, point: Point) -> Identifier<'a> {
@@ -132,13 +169,17 @@ impl<'a> SourceCode<'a> {
                 | "parenthesized_expression"
                 | "call_expression"
                 | "identifier"
+                | "property_identifier"
+                | "member_expression"
+                | "variable_declarator"
+                | "lexical_declaration"
                 | "expression_statement" => {}
                 "function_declaration" | "function" => {
                     ident.0.push(Function(field!(node, "name").unwrap()))
                 }
                 "method_definition" => ident.0.push(Method(field!(node, "name").unwrap())),
                 "class_declaration" => ident.0.push(Class(field!(node, "name").unwrap())),
-                k => log::error!("unrecognized node kind: {k}"),
+                k => log::warn!("unrecognized node kind: {k}"),
             }
             match node.parent() {
                 Some(parent) => node = parent,
@@ -185,50 +226,64 @@ impl<'a> SourceCode<'a> {
         climb(node, &self.source, 0);
     }
 
-    fn callers(&'a self, ident: &Identifier<'_>) -> Vec<(Point, &'a SourceCode<'a>, Identifier<'a>)> {
-        let mut parser = tree_sitter::Parser::new();
+    fn callers(
+        &'a self,
+        ident: &Identifier<'_>,
+    ) -> Result<Vec<(Point, &'a SourceCode<'a>, Identifier<'a>)>> {
+        let language =
+            tree_sitter_stack_graphs_javascript::try_language_configuration(&NoCancellation)
+                .context("loading javascript TSG")?;
+        let mut graph = StackGraph::new();
+        let file = graph
+            .add_file(&self.path.to_string_lossy())
+            .expect("file not present in empty graph");
+        let globals = Variables::new();
+        language
+            .sgl
+            .build_stack_graph_into(&mut graph, file, &self.source, &globals, &NoCancellation)
+            .context("building stack graph")?;
 
-        let language = tree_sitter_javascript::language();
-        parser
-            .set_language(language)
-            .expect("Error loading JavaScript grammar");
+        let name = match ident.0.first() {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        };
+        let references = graph.iter_nodes().filter_map(|node| {
+            use IdentifierPart::*;
 
-        let parsed_tree = parser
-            .parse(&self.source, None)
-            .expect("Failed to parse source");
-        let root_node: Node<'_> = parsed_tree.root_node();
-        let mut cursor = QueryCursor::new();
-        let query = Query::new(
-            language,
-            &format!(
-                r#"(call_expression (identifier) @func (arguments) @args (#match? @func "{}"))"#,
-                ident.0.first().unwrap()
-            ),
-        )
-        .unwrap();
+            if !graph[node].is_reference() {
+                return None;
+            }
 
-        let mut callers = Vec::new();
-        for m in cursor.matches(
-            &query,
-            root_node,
-            |node: Node<'_>| match node.utf8_text(self.source.as_bytes()) {
-                Ok(name) => return std::iter::once(name.as_bytes()),
-                Err(err) => panic!("{err}"),
-            }, //&source
-        ) {
-            let mut captures = m.captures.iter();
-            let ident = captures.next().expect("identifier").node;
-            let args = captures.next().expect("args").node;
-            log::debug!(
-                "{}{} @ {}:{}",
-                ident.utf8_text(self.source.as_bytes()).unwrap(),
-                args.utf8_text(self.source.as_bytes()).unwrap(),
-                self.path.display(),
-                ident.start_position().row,
-            );
-            let start = ident.start_position();
-            callers.push((start, self, self.build_identifier(start)))
-        }
-        callers
+            match name {
+                Class(name) | Method(name) | Function(name) => {
+                    if *name != &graph[graph[node].symbol()?] {
+                        return None;
+                    }
+                }
+            }
+
+            Some(node)
+        });
+        Ok(references
+            .inspect(|node| log::debug!("{}", node.display(&graph)))
+            .filter_map(|node| {
+                let span = &graph.source_info(node)?.span;
+                let point = Point {
+                    row: span.start.line,
+                    column: span.start.column.utf8_offset,
+                };
+                let ident = self.build_identifier(point);
+                let mut callers = match self.callers(&ident) {
+                    Ok(callers) => callers,
+                    Err(err) => {
+                        log::error!("{err}");
+                        return None;
+                    }
+                };
+                callers.insert(0, (point, self, ident));
+                Some(callers)
+            })
+            .flatten()
+            .collect())
     }
 }
