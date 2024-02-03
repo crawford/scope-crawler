@@ -627,6 +627,7 @@ dependencies = [
  "anyhow",
  "clap",
  "log",
+ "lsp-positions",
  "pretty_env_logger",
  "stack-graphs",
  "tree-sitter",
@@ -634,6 +635,7 @@ dependencies = [
  "tree-sitter-stack-graphs",
  "tree-sitter-stack-graphs-javascript",
  "tree-sitter-stack-graphs-typescript",
+ "tree-sitter-typescript",
 ]
 
 [[package]]

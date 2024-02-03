@@ -16,3 +16,5 @@ stack-graphs = { git = "https://github.com/github/stack-graphs", branch = "main"
 tree-sitter-stack-graphs = { git = "https://github.com/github/stack-graphs", branch = "main" }
 tree-sitter-stack-graphs-typescript = { git = "https://github.com/github/stack-graphs", branch = "main" }
 tree-sitter-stack-graphs-javascript = { git = "https://github.com/github/stack-graphs", branch = "main" }
+tree-sitter-typescript = "0.20.2"
+lsp-positions = { git = "https://github.com/github/stack-graphs", branch = "main" }
