@@ -15,7 +15,7 @@ use tree_sitter_stack_graphs::Variables;
 #[derive(clap::Parser)]
 struct Options {
     file: PathBuf,
-    line: usize,
+    line: std::num::NonZeroUsize, // one-indexed
 
     #[arg(long = "timeout", short = 't', default_value = "5", value_parser = parse_duration)]
     timeout: Duration,
@@ -65,22 +65,23 @@ fn main() -> Result<()> {
     // let cancel = stack_graphs::CancelAfterDuration::new(options.timeout);
     let source = SourceCode::from_path(&options.file)
         .context(anyhow::anyhow!("reading {}", options.file.display()))?;
-    let (ident, range) = source.find_scope(row!(options.line))?;
+    let ident = source
+        .find_ident(row!(options.line.get() - 1))
+        .context("finding identifier")?;
+    let parent = source
+        .find_scope(row!(options.line.get() - 1))
+        .context("finding parent scope")?;
 
-    log::info!(
-        "{ident} @ [{}:{}] - [{}:{}]",
-        range.start_point.row + 1,
-        range.start_point.column,
-        range.end_point.row + 1,
-        range.end_point.column
-    );
-    // std::thread::sleep(std::time::Duration::from_secs(1));
-    // let _ = tree_sitter_stack_graphs_javascript::try_language_configuration(&tree_sitter_stack_graphs::NoCancellation)
-    //     .map_err(|err| log::error!("main() failed to load TSG: {err}"));
+    log::info!("{ident:?} in {parent:?}");
 
-    println!("'{ident}' called by:");
-    for (point, source, caller) in source.callers(&ident, range).context("getting callers")? {
-        println!("- '{caller}' @ {}:{}", source.path.display(), point.row);
+    // println!("'{ident}' called by:");
+    // for (point, source, caller) in source.callers(&parent).context("getting callers")? {
+    //     println!("- '{caller}' @ {}:{}", source.path.display(), point.row);
+    // }
+
+    println!("'{parent}' calls:");
+    for call in source.references(&ident).context("getting calls")? {
+        println!("- '{call:?}'");
     }
 
     Ok(())
@@ -103,11 +104,14 @@ impl std::fmt::Display for IdentifierPart<'_> {
     }
 }
 
-struct Identifier<'a>(Vec<IdentifierPart<'a>>);
+struct Identifier<'a> {
+    node: tree_sitter::Node<'a>,
+    parts: Vec<IdentifierPart<'a>>,
+}
 
 impl std::fmt::Display for Identifier<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut parts = self.0.iter().rev();
+        let mut parts = self.parts.iter().rev();
         match parts.next() {
             Some(part) => write!(f, "{part}")?,
             None => return Ok(()),
@@ -115,47 +119,135 @@ impl std::fmt::Display for Identifier<'_> {
         for part in parts {
             write!(f, "::{part}")?;
         }
+
         Ok(())
+    }
+}
+
+impl std::fmt::Debug for Identifier<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let start = self.node.start_position();
+        let end = self.node.end_position();
+        write!(
+            f,
+            "{self} @ [{}, {}] - [{}, {}]",
+            start.row + 1,
+            start.column,
+            end.row + 1,
+            end.column,
+        )
     }
 }
 
 struct SourceCode<'a> {
     path: &'a Path,
     source: String,
-    // graph: StackGraph,
+    tree: tree_sitter::Tree,
+    graph: StackGraph,
 }
 
 impl<'a> SourceCode<'a> {
     fn from_path(path: &'a Path) -> Result<SourceCode<'a>> {
-        let code = SourceCode {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(tree_sitter_typescript::language_typescript())
+            .context("loading typescript grammar")?;
+        let source = std::fs::read_to_string(path).context("opening {path}")?;
+        let tree = parser.parse(&source, None).context("parsing source code")?;
+
+        let mut graph = StackGraph::new();
+        let globals = Variables::new();
+        let file = graph
+            .add_file(&path.to_string_lossy())
+            .expect("file not present in empty graph");
+        let language = tree_sitter_stack_graphs_typescript::try_language_configuration(
+            &tree_sitter_stack_graphs::NoCancellation,
+        )
+        .context("loading typescript TSG")?;
+        language
+            .sgl
+            .build_stack_graph_into(
+                &mut graph,
+                file,
+                &source,
+                &globals,
+                &tree_sitter_stack_graphs::NoCancellation,
+            )
+            .context("building stack graph")?;
+
+        Ok(SourceCode {
             path,
-            source: std::fs::read_to_string(path).context("opening {path}")?,
-            // graph: StackGraph::new(),
-        };
+            source,
+            tree,
+            graph,
+        })
+    }
 
-        // XXX: Why does this line panic?
-        // let language = tree_sitter_stack_graphs_javascript::language_configuration(&tree_sitter_stack_graphs::NoCancellation);
-        // let language =
-        //     tree_sitter_stack_graphs_javascript::try_language_configuration(&tree_sitter_stack_graphs::NoCancellation)
-        //         .context("loading javascript TSG")?;
+    fn find_ident(&'a self, point: tree_sitter::Point) -> Result<Identifier<'a>> {
+        let node = self
+            .tree
+            .root_node()
+            .descendant_for_point_range(point, point)
+            .context("finding descendant at point")?;
 
-        // let mut graph = StackGraph::new();
-        // let file = graph
-        //     .add_file(&path.to_string_lossy())
-        //     .expect("file not present in empty graph");
-        // let globals = Variables::new();
-        // language
-        //     .sgl
-        //     .build_stack_graph_into(
-        //         &mut code.graph,
-        //         file,
-        //         &code.source,
-        //         &globals,
-        //         &tree_sitter_stack_graphs::NoCancellation,
-        //     )
-        //     .context("building stack graph")?;
+        self.log_tree(node);
 
-        Ok(code)
+        macro_rules! field {
+            ($node:ident, $name:literal) => {{
+                $node
+                    .child_by_field_name($name)
+                    .ok_or(anyhow::anyhow!("field '{}' not found", $name))
+                    .and_then(|name| name.utf8_text(self.source.as_bytes()).map_err(Into::into))
+            }};
+        }
+
+        let mut parts = Vec::new();
+        let mut parent = node;
+
+        macro_rules! capture {
+            ($ident:path) => {{
+                field!(parent, "name")
+                    .and_then(|name| Ok(parts.push($ident(name))))
+                    .context("couldn't get node name")
+            }};
+        }
+
+        loop {
+            use IdentifierPart::*;
+
+            match parent.kind() {
+                "statement_block"
+                | "class_body"
+                | "class"
+                | "program"
+                | "}"
+                | "parenthesized_expression"
+                | "call_expression"
+                | "identifier"
+                | "property_identifier"
+                | "member_expression"
+                | "variable_declarator"
+                | "lexical_declaration"
+                | "if_statement"
+                | "export_statement"
+                | "return_statement"
+                | "expression_statement" => {}
+                "function_declaration" | "function" => capture!(Function)
+                    .context(format!("couldn't get name of function at {parent:?}",))?,
+                "method_definition" => capture!(Method)
+                    .context(format!("couldn't get name of method at {parent:?}",))?,
+                "class_declaration" => {
+                    capture!(Class).context(format!("couldn't get name of class at {parent:?}",))?
+                }
+                k => log::debug!("unrecognized node kind: {k}"),
+            }
+            match parent.parent() {
+                Some(p) => parent = p,
+                None => break,
+            }
+        }
+
+        Ok(Identifier { node, parts })
     }
 
     /// Find the owning scope at the given point
@@ -163,22 +255,13 @@ impl<'a> SourceCode<'a> {
     /// This uses tree_sitter to walk up the syntax tree to find the nearest definition that
     /// contains the given point. The identifier is returned, though I don't know how useful that is
     /// anymore, along with the definition's point.
-    fn find_scope(
-        &'a self,
-        point: tree_sitter::Point,
-    ) -> Result<(Identifier<'a>, tree_sitter::Range)> {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(tree_sitter_typescript::language_typescript())
-            .context("loading typescript grammar")?;
-
-        let parsed_tree = parser
-            .parse(&self.source, None)
-            .expect("Failed to parse code");
-        let root_node: tree_sitter::Node<'_> = parsed_tree.root_node();
-        let mut node = root_node
+    fn find_scope(&'a self, point: tree_sitter::Point) -> Result<Identifier<'a>> {
+        let mut node = self
+            .tree
+            .root_node()
             .descendant_for_point_range(point, point)
             .context("finding descendant at point")?;
+
         self.log_tree(node);
 
         macro_rules! field {
@@ -190,15 +273,11 @@ impl<'a> SourceCode<'a> {
             }};
         }
 
-        let mut ident = Identifier(Vec::new());
-        let mut range = None;
+        let mut parts = Vec::new();
 
         macro_rules! capture {
             ($ident:path) => {{
-                ident.0.push($ident(field!(node, "name").unwrap()));
-                if range.is_none() {
-                    range = Some(node.range());
-                }
+                parts.push($ident(field!(node, "name").unwrap()));
             }};
         }
 
@@ -225,7 +304,7 @@ impl<'a> SourceCode<'a> {
                 "function_declaration" | "function" => capture!(Function),
                 "method_definition" => capture!(Method),
                 "class_declaration" => capture!(Class),
-                k => log::info!("unrecognized node kind: {k}"),
+                k => log::debug!("unrecognized node kind: {k}"),
             }
             match node.parent() {
                 Some(parent) => node = parent,
@@ -233,7 +312,7 @@ impl<'a> SourceCode<'a> {
             }
         }
 
-        Ok((ident, range.context("finding enclosing definition")?))
+        Ok(Identifier { node, parts })
     }
 
     fn log_tree(&self, node: tree_sitter::Node) {
@@ -243,7 +322,7 @@ impl<'a> SourceCode<'a> {
                 None => depth,
             };
 
-            let indent = " ".repeat((max_depth - depth) * 2);
+            let indent = " ".repeat(max_depth - depth);
             macro_rules! show {
                 ($name:literal, $fmt:literal $(, $args:tt)*) => {{
                     match node.child_by_field_name($name) {
@@ -272,10 +351,135 @@ impl<'a> SourceCode<'a> {
         climb(node, &self.source, 0);
     }
 
+    fn references(&'a self, ident: &Identifier<'_>) -> Result<Vec<Identifier<'a>>> {
+        // - read all of the symbol references (function calls, variable use) and store them in a map
+        //   of references to definitions
+        // - build an index of definitions to their references
+
+        use IdentifierPart::*;
+
+        let name = ident
+            .parts
+            .first()
+            .map(|p| match p {
+                Method(name) | Class(name) | Function(name) => *name,
+            })
+            .context("getting name of identifier")?;
+        let symbol = self
+            .graph
+            .iter_symbols()
+            .find(|s| name == &self.graph[*s])
+            .context(format!("finding symbol for {ident}"))?;
+
+        log::error!(
+            "[{}, {}] - [{}, {}]",
+            ident.node.start_position().row,
+            ident.node.start_position().column,
+            ident.node.end_position().row,
+            ident.node.end_position().column,
+        );
+        let node = self
+            .graph
+            .iter_nodes()
+            .find(|n| {
+                if !self.graph[*n].is_definition() {
+                    return false;
+                }
+
+                self.graph
+                    .source_info(*n)
+                    .map(|i| {
+                        log::error!(
+                            "at: {} [{}, {}] - [{}, {}]",
+                            n.display(&self.graph),
+                            i.span.start.line,
+                            i.span.start.column.utf8_offset,
+                            i.span.end.line,
+                            i.span.end.column.utf8_offset,
+                        );
+                        i.span.start.line == ident.node.start_position().row
+                        // && i.span.end.line == ident.node.end_position().row
+                    })
+                    .unwrap_or(false)
+            })
+            .context(format!("finding node for {ident}"))?;
+        log::error!("symbol: {}", &self.graph[symbol]);
+        log::error!("node:   {}", node.display(&self.graph));
+
+        log::error!(
+            "{}",
+            self.graph
+                .iter_nodes()
+                .find(|n| {
+                    let node = &self.graph[*n];
+                    if !node.is_reference() {
+                        return false;
+                    }
+
+                    if name != &self.graph[node.symbol().expect("references have a symbol")] {
+                        return false;
+                    }
+
+                    let config = StitcherConfig::default();
+                    let mut partials = PartialPaths::new();
+                    let mut candidates = GraphEdgeCandidates::new(&self.graph, &mut partials, None);
+
+                    let mut found= false;
+                    let _ =
+                        stack_graphs::stitching::ForwardPartialPathStitcher::find_all_complete_partial_paths(
+                            &mut candidates,
+                            [*n],
+                            config,
+                            &stack_graphs::NoCancellation,
+                            |graph, _partials, partial| {
+                                let start_span = &graph.source_info(partial.start_node).unwrap().span;
+                                let end_span = &graph.source_info(partial.end_node).unwrap().span;
+                                log::debug!(
+                                    "potential call-site: [{}:{}] - [{}:{}] -> [{}:{}] - [{}:{}]",
+                                    start_span.start.line + 1,
+                                    start_span.start.column.utf8_offset,
+                                    start_span.end.line + 1,
+                                    start_span.end.column.utf8_offset,
+                                    end_span.start.line + 1,
+                                    end_span.start.column.utf8_offset,
+                                    end_span.end.line + 1,
+                                    end_span.end.column.utf8_offset,
+                                );
+
+                                found = true;
+
+                                // if ((end_span.start.line > ident.node.start_position().row)
+                                //     || (end_span.start.line == ident.node.start_position().row
+                                //         && end_span.start.column.grapheme_offset
+                                //         >= ident.node.start_position().column))
+                                //     && ((end_span.end.line == ident.node.end_position().row
+                                //          && end_span.end.column.grapheme_offset
+                                //          <= ident.node.end_position().column)
+                                //         || (end_span.end.line < ident.node.end_position().row))
+                                // {
+                                //     // callsites.push(partial);
+                                //     match self.find_scope(tree_sitter::Point {
+                                //         row: start_span.start.line,
+                                //         column: start_span.start.column.utf8_offset,
+                                //     }) {
+                                //         Ok(ident) => println!("- {}", ident),
+                                //         Err(err) => log::error!("{err}"),
+                                //     }
+                                //     // println!("- {}", partial.start_node.display(&graph));
+                                // }
+                            },
+                        );
+                    found
+                })
+                .unwrap()
+                .display(&self.graph)
+        );
+        Ok(Vec::new())
+    }
+
     fn callers(
         &'a self,
         ident: &Identifier<'_>,
-        range: tree_sitter::Range,
     ) -> Result<Vec<(tree_sitter::Point, &'a SourceCode<'a>, Identifier<'a>)>> {
         let language = tree_sitter_stack_graphs_typescript::try_language_configuration(
             &tree_sitter_stack_graphs::NoCancellation,
@@ -297,12 +501,10 @@ impl<'a> SourceCode<'a> {
             )
             .context("building stack graph")?;
 
-        let name = match ident.0.first() {
+        let name = match ident.parts.first() {
             Some(s) => s,
             None => return Ok(Vec::new()),
         };
-        // let references = graph.iter_nodes().filter_map(|node| {
-        //     use IdentifierPart::*;
 
         let mut partials = PartialPaths::new();
         let mut candidates = GraphEdgeCandidates::new(&graph, &mut partials, None);
@@ -317,33 +519,21 @@ impl<'a> SourceCode<'a> {
                     if !graph[node].is_definition() {
                         return None;
                     }
-                    // println!("ALEX: reference node");
 
                     let source_info = graph.source_info(node)?;
-                    // println!("{} {:?}", node.display(&graph), source_info.span);
 
-                    // let line = point.row - 1;
                     log::trace!("considering: {}", node.display(&graph));
                     log::trace!("  {:?}", source_info.span);
-                    log::trace!("  {range:?}");
-                    // if ((source_info.span.start.line < (range.start_point.row + 1))
-                    //     || (source_info.span.start.line == (range.start_point.row + 1)
-                    //         && source_info.span.start.column.grapheme_offset
-                    //             <= range.start_point.column))
-                    //     && ((source_info.span.end.line == (range.end_point.row + 1)
-                    //         && source_info.span.end.column.grapheme_offset
-                    //             >= range.end_point.column)
-                    //         || (source_info.span.end.line > (range.end_point.row + 1)))
-                    // {
-                    if source_info.span.start.line == range.start_point.row {
-                        // if source_info.span.start.line <= line && source_info.span.end.line >= line {
-                        // println!("ALEX: {}", node.display(&graph));
+                    log::trace!("  {:?}", ident.node.range());
+
+                    if source_info.span.start.line == ident.node.start_position().row {
                         Some(node)
                     } else {
                         None
                     }
                 })
             });
+
         let definition = definitions.next().context("finding definition")?;
         definitions
             .for_each(|def| log::warn!("additional definition found: {}", def.display(&graph)));
@@ -358,10 +548,6 @@ impl<'a> SourceCode<'a> {
                     if !graph[node].is_reference() {
                         return Option::<stack_graphs::arena::Handle<stack_graphs::graph::Node>>::None;
                     }
-                    // println!("ALEX: reference node");
-
-                    // let source_info = graph.source_info(node)?;
-                    // println!("{} {:?}", node.display(&graph), source_info.span);
 
                     use IdentifierPart::*;
                     match name {
@@ -373,8 +559,6 @@ impl<'a> SourceCode<'a> {
                     }
 
                     log::debug!("considering: {}", node.display(&graph));
-                    // log::debug!("  {:?}", source_info.span);
-                    // log::debug!("  {range:?}");
                     Some(node)
                 })
             });
@@ -402,19 +586,21 @@ impl<'a> SourceCode<'a> {
                         end_span.end.column.utf8_offset,
                     );
 
-                    if ((end_span.start.line > range.start_point.row)
-                        || (end_span.start.line == range.start_point.row
-                            && end_span.start.column.grapheme_offset >= range.start_point.column))
-                        && ((end_span.end.line == range.end_point.row
-                            && end_span.end.column.grapheme_offset <= range.end_point.column)
-                            || (end_span.end.line < range.end_point.row))
+                    if ((end_span.start.line > ident.node.start_position().row)
+                        || (end_span.start.line == ident.node.start_position().row
+                            && end_span.start.column.grapheme_offset
+                                >= ident.node.start_position().column))
+                        && ((end_span.end.line == ident.node.end_position().row
+                            && end_span.end.column.grapheme_offset
+                                <= ident.node.end_position().column)
+                            || (end_span.end.line < ident.node.end_position().row))
                     {
                         // callsites.push(partial);
                         match self.find_scope(tree_sitter::Point {
                             row: start_span.start.line,
                             column: start_span.start.column.utf8_offset,
                         }) {
-                            Ok((ident, _range)) => println!("- '{}'", ident),
+                            Ok(ident) => println!("- {}", ident),
                             Err(err) => log::error!("{err}"),
                         }
                         // println!("- {}", partial.start_node.display(&graph));
