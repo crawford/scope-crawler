@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use stack_graphs::arena::Handle;
 // use stack_graphs::graph::PushSymbolNode;
 // use stack_graphs::graph::ScopeNode;
 use stack_graphs::graph::StackGraph;
@@ -7,6 +8,7 @@ use stack_graphs::partial::PartialPaths;
 use stack_graphs::stitching::GraphEdgeCandidates;
 // use stack_graphs::stitching::GraphEdgeCandidates;
 use stack_graphs::stitching::StitcherConfig;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 // use tree_sitter::{Node, Point};
@@ -16,6 +18,7 @@ use tree_sitter_stack_graphs::Variables;
 struct Options {
     file: PathBuf,
     line: std::num::NonZeroUsize, // one-indexed
+    column: Option<usize>,        // zero-indexed
 
     #[arg(long = "timeout", short = 't', default_value = "5", value_parser = parse_duration)]
     timeout: Duration,
@@ -48,43 +51,188 @@ fn main() -> Result<()> {
         .filter_level(filter(options.verbosity))
         .filter_module(
             "tree_sitter_graph",
-            filter(options.verbosity.saturating_sub(1)),
+            filter(options.verbosity.saturating_sub(2)),
         )
         .try_init()
         .expect("initializing logging");
 
-    macro_rules! row {
-        ($row:expr) => {
-            tree_sitter::Point {
-                row: $row,
-                column: 0,
-            }
-        };
-    }
+    // macro_rules! row {
+    //     ($row:expr) => {
+    //         tree_sitter::Point {
+    //             row: $row,
+    //             column: 999,
+    //         }
+    //     };
+    // }
 
     // let cancel = stack_graphs::CancelAfterDuration::new(options.timeout);
     let source = SourceCode::from_path(&options.file)
         .context(anyhow::anyhow!("reading {}", options.file.display()))?;
-    let ident = source
-        .find_ident(row!(options.line.get() - 1))
-        .context("finding identifier")?;
-    let parent = source
-        .find_scope(row!(options.line.get() - 1))
-        .context("finding parent scope")?;
 
-    log::info!("{ident:?} in {parent:?}");
+    let mut references =
+        HashMap::<Handle<stack_graphs::graph::Node>, Vec<Handle<stack_graphs::graph::Node>>>::new();
 
-    // println!("'{ident}' called by:");
-    // for (point, source, caller) in source.callers(&parent).context("getting callers")? {
-    //     println!("- '{caller}' @ {}:{}", source.path.display(), point.row);
-    // }
+    for node in source
+        .graph
+        .iter_nodes()
+        .filter(|n| source.graph[*n].is_reference())
+    {
+        let config = StitcherConfig::default();
+        let mut partials = PartialPaths::new();
+        let mut candidates = GraphEdgeCandidates::new(&source.graph, &mut partials, None);
 
-    println!("'{parent}' calls:");
-    for call in source.references(&ident).context("getting calls")? {
-        println!("- '{call:?}'");
+        stack_graphs::stitching::ForwardPartialPathStitcher::find_all_complete_partial_paths(
+            &mut candidates,
+            [node],
+            config,
+            &stack_graphs::NoCancellation,
+            |graph, _partials, partial| {
+                let start_span = &graph.source_info(partial.start_node).unwrap().span;
+                let end_span = &graph.source_info(partial.end_node).unwrap().span;
+                log::debug!(
+                    "reference: '{}' [{}:{}] - [{}:{}] -> [{}:{}] - [{}:{}]",
+                    &graph[graph[partial.start_node]
+                        .symbol()
+                        .expect("reference missing symbol")],
+                    start_span.start.line + 1,
+                    start_span.start.column.utf8_offset,
+                    start_span.end.line + 1,
+                    start_span.end.column.utf8_offset,
+                    end_span.start.line + 1,
+                    end_span.start.column.utf8_offset,
+                    end_span.end.line + 1,
+                    end_span.end.column.utf8_offset,
+                );
+
+                references
+                    .entry(partial.end_node)
+                    .or_insert_with(|| Vec::new())
+                    .push(partial.start_node);
+
+                let info = graph
+                    .node_debug_info(partial.start_node)
+                    .expect("debug info");
+                info.iter().for_each(|entry| {
+                    log::trace!(
+                        "{:?} = {}",
+                        &source.graph[entry.key],
+                        &source.graph[entry.value]
+                    );
+                });
+            },
+        )?;
     }
 
+    macro_rules! display_span {
+        ($span:expr) => {{
+            format!(
+                "[{}, {}] - [{}, {}]",
+                $span.start.line + 1,
+                $span.start.column.utf8_offset,
+                $span.end.line + 1,
+                $span.end.column.utf8_offset
+            )
+        }};
+    }
+
+    let symbol = source
+        .symbol_at_point(tree_sitter::Point {
+            row: options.line.get() - 1,
+            column: options.column.unwrap_or(999),
+        })
+        .expect("symbol");
+
+    println!("{:#?}", symbol);
+
+    fn walk_symbol_call_tree(
+        symbol: SymbolBody,
+        source: &SourceCode,
+        references: &HashMap<
+            Handle<stack_graphs::graph::Node>,
+            Vec<Handle<stack_graphs::graph::Node>>,
+        >,
+    ) {
+        for (def, refs) in references {
+            refs.iter().for_each(|r| {
+                log::debug!(
+                    "considering definition: {} <- {}",
+                    display_span!(source.graph.source_info(*def).unwrap().span),
+                    display_span!(source.graph.source_info(*r).unwrap().span),
+                );
+
+                let info = source.graph.source_info(*def).unwrap();
+                if info.span.start >= symbol.body.start_position()
+                    && info.span.end <= symbol.body.end_position()
+                    && info.span.start.line == symbol.body.start_position().row
+                {
+                    let symbol = source
+                        .symbol_at_point(
+                            source.graph.source_info(*r).unwrap().span.start.as_point(),
+                        )
+                        .unwrap();
+
+                    println!("{symbol:#?}",);
+
+                    walk_symbol_call_tree(symbol, source, references)
+                }
+            });
+        }
+    }
+    walk_symbol_call_tree(symbol, &source, &references);
+
+    // println!(
+    //     "{}",
+    //     source
+    //         .graph
+    //         .iter_nodes()
+    //         .filter(|node| source.graph[*node].is_definition())
+    //         .find(|node| {
+    //             log::debug!(
+    //                 "node: {} ({})",
+    //                 node.display(&source.graph),
+    //                 display_span!(source.graph.source_info(*node).expect("source info").span)
+    //             );
+
+    //             // `node` is the identifier of the function; not the body
+    //             // source
+    //             //     .tree
+    //             source
+    //                 .graph
+    //                 .source_info(*node)
+    //                 .expect("source info")
+    //                 .span
+    //                 .contains_point(&row!(options.line.get() - 1))
+    //         })
+    //         .expect("find node")
+    //         .display(&source.graph)
+    // );
+
+    // let ident = source
+    //     .find_ident(row!(options.line.get() - 1))
+    //     .context("finding identifier")?;
+    // let parent = source
+    //     .find_scope(row!(options.line.get() - 1))
+    //     .context("finding parent scope")?;
+
+    // log::info!("{ident:?} in {parent:?}");
+
+    // // println!("'{ident}' called by:");
+    // // for (point, source, caller) in source.callers(&parent).context("getting callers")? {
+    // //     println!("- '{caller}' @ {}:{}", source.path.display(), point.row);
+    // // }
+
+    // println!("'{parent}' calls:");
+    // for call in source.references(&ident).context("getting calls")? {
+    //     println!("- '{call:?}'");
+    // }
+
     Ok(())
+}
+
+#[derive(Debug)]
+struct SymbolBody<'a> {
+    identifier: Identifier<'a>,
+    body: tree_sitter::Node<'a>,
 }
 
 #[derive(Debug)]
@@ -183,6 +331,24 @@ impl<'a> SourceCode<'a> {
         })
     }
 
+    fn symbol_at_point(&'a self, point: tree_sitter::Point) -> Result<SymbolBody<'a>> {
+        let identifier = self.find_ident(point)?;
+        let mut node = identifier.node;
+        let body = loop {
+            match node.kind() {
+                "method_definition" => break Some(node),
+                "function_declaration" => break Some(node),
+                _ => {}
+            }
+            match node.parent() {
+                Some(parent) => node = parent,
+                None => break None,
+            }
+        }
+        .context("finding symbol body")?;
+        Ok(SymbolBody { identifier, body })
+    }
+
     fn find_ident(&'a self, point: tree_sitter::Point) -> Result<Identifier<'a>> {
         let node = self
             .tree
@@ -190,7 +356,7 @@ impl<'a> SourceCode<'a> {
             .descendant_for_point_range(point, point)
             .context("finding descendant at point")?;
 
-        self.log_tree(node);
+        // self.log_tree(node);
 
         macro_rules! field {
             ($node:ident, $name:literal) => {{
@@ -232,7 +398,7 @@ impl<'a> SourceCode<'a> {
                 | "export_statement"
                 | "return_statement"
                 | "expression_statement" => {}
-                "function_declaration" | "function" => capture!(Function)
+                "function_declaration" => capture!(Function)
                     .context(format!("couldn't get name of function at {parent:?}",))?,
                 "method_definition" => capture!(Method)
                     .context(format!("couldn't get name of method at {parent:?}",))?,
