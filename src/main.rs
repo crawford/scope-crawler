@@ -298,6 +298,22 @@ impl<'a> SourceCode<'a> {
 
         let mut partials = PartialPaths::new();
         let mut db = stack_graphs::stitching::Database::new();
+
+        // Populate the database to get the paths in the visualization
+        let mut candidates = GraphEdgeCandidates::new(&graph, &mut partials, None);
+        stack_graphs::stitching::ForwardPartialPathStitcher::find_all_complete_partial_paths(
+            &mut candidates,
+            graph
+                .iter_nodes()
+                .filter(|n| graph[*n].is_reference())
+                .collect::<Vec<_>>(),
+            StitcherConfig::default(),
+            &stack_graphs::NoCancellation,
+            |g, ps, p| {
+                db.add_partial_path(g, ps, p.clone());
+            },
+        )?;
+
         let contents = graph.to_html_string(
             "test",
             &mut partials,
