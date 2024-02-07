@@ -1,14 +1,14 @@
-interface Shape {
-    area(): number
+interface Shape<T> {
+    area(): T
 }
 
-class Square implements Shape {
+class Square implements Shape<number> {
     area(): number {
-	1
+	    return 1
     }
 }
 
 function main() {
-    (new Square() as Shape).area()
+    (new Square() as Shape<number>).area()
     // new Square().area()
 }
