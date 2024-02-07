@@ -292,7 +292,7 @@ impl<'a> SourceCode<'a> {
         // XXX: manually amend the graph to include a relationship between Square and Shape
         // 222 - [syntax node new_expression(12, 6)] @gen_expr.applied_type
         // 238 - [syntax node type_identifier(12, 22)] @type.type
-        let specialization = graph.node_for_id(NodeID::new_in_file(file, 259)).unwrap();
+        let specialization = graph.node_for_id(NodeID::new_in_file(file, 262)).unwrap();
         let generalization = graph.node_for_id(NodeID::new_in_file(file, 278)).unwrap();
         graph.add_edge(generalization, specialization, 0);
 
