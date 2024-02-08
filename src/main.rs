@@ -187,6 +187,7 @@ struct SymbolBody<'a> {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum IdentifierPart<'a> {
+    Export(&'a str),
     Class(&'a str),
     Interface(&'a str),
     Function(&'a str),
@@ -199,7 +200,8 @@ impl std::fmt::Display for IdentifierPart<'_> {
         use IdentifierPart::*;
 
         match self {
-            Class(name) | Function(name) | Method(name) | Anonymous(name) | Interface(name) => {
+            Export(name) | Class(name) | Function(name) | Method(name) | Anonymous(name)
+            | Interface(name) => {
                 write!(f, "{name}")
             }
         }
@@ -333,6 +335,12 @@ impl<'a> SourceCode<'a> {
                 | "arrow_function"
                 | "function_declaration"
                 | "method_definition" => break Some(node),
+                "call_expression" if self.export_name(node).is_some() => {
+                    return Ok(SymbolBody {
+                        identifier: self.find_ident(node.start_position()).unwrap_or(ident),
+                        body: node,
+                    });
+                }
                 _ => {}
             }
             match node.parent() {
@@ -347,6 +355,38 @@ impl<'a> SourceCode<'a> {
             .unwrap_or(Ok(ident))
             .context("finding symbol identifier")?;
         Ok(SymbolBody { identifier, body })
+    }
+
+    fn export_name(&'a self, node: tree_sitter::Node) -> Option<&'a str> {
+        if let Some(expr) = node.child_by_field_name("function") {
+            // XXX: this is fragile
+            if expr.utf8_text(self.source.as_bytes()) == Ok("Object.defineProperty") {
+                let args = node
+                    .child_by_field_name("arguments")
+                    .expect("call expression without 'arguments'");
+                let mut cursor = self.tree.walk();
+                let mut subject = None;
+                let mut name = None;
+                let mut object = None;
+                args.children(&mut cursor).for_each(|n| match n.kind() {
+                    "identifier" => subject = Some(n),
+                    "string" => name = Some(n),
+                    "object" => object = Some(node),
+                    "(" | ")" | "," => {}
+                    kind => log::warn!("{kind}"),
+                });
+
+                if let (Some(subject), Some(name)) = (subject, name) {
+                    if subject.utf8_text(self.source.as_bytes()) == Ok("exports") {
+                        return Some(name
+                            .utf8_text(self.source.as_bytes())
+                            .unwrap()
+                            .trim_matches('\''));
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn find_ident(&'a self, point: tree_sitter::Point) -> Result<Identifier<'a>> {
@@ -388,7 +428,6 @@ impl<'a> SourceCode<'a> {
                 | "program"
                 | "}"
                 | "parenthesized_expression"
-                | "call_expression"
                 | "identifier"
                 | "property_identifier"
                 | "member_expression"
@@ -407,8 +446,13 @@ impl<'a> SourceCode<'a> {
                     capture!(Class).context(format!("couldn't get name of class at {parent:?}"))?
                 }
                 "interface_declaration" => capture!(Interface)
-                k => log::trace!("unrecognized node kind: {k}"),
                     .context(format!("couldn't get name of interface at {parent:?}"))?,
+                "call_expression" => {
+                    if let Some(name) = self.export_name(parent) {
+                        parts.push(Export(name));
+                    }
+                }
+                k => log::trace!("unrecognized node ({parent:?}) kind '{k}'"),
             }
             match parent.parent() {
                 Some(p) => parent = p,
