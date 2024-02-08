@@ -30,11 +30,7 @@ fn parse_duration(arg: &str) -> Result<Duration, std::num::ParseIntError> {
     Ok(Duration::from_secs(seconds))
 }
 
-fn main() -> Result<()> {
-    use clap::Parser;
-
-    let options = Options::parse();
-
+fn init_logging(verbosity: u8) {
     fn filter(v: u8) -> log::LevelFilter {
         use log::LevelFilter::*;
         match v {
@@ -46,19 +42,35 @@ fn main() -> Result<()> {
     }
 
     pretty_env_logger::formatted_builder()
-        .filter_level(filter(options.verbosity))
-        .filter_module(
-            "tree_sitter_graph",
-            filter(options.verbosity.saturating_sub(2)),
-        )
+        .filter_level(filter(verbosity))
+        .filter_module("tree_sitter_graph", filter(verbosity.saturating_sub(2)))
         .try_init()
         .expect("initializing logging");
+}
+
+fn main() -> Result<()> {
+    use clap::Parser;
+
+    let options = Options::parse();
+    init_logging(options.verbosity);
 
     let source = SourceCode::from_path(&options.file)
         .context(anyhow::anyhow!("reading {}", options.file.display()))?;
 
     let mut references =
         HashMap::<Handle<stack_graphs::graph::Node>, Vec<Handle<stack_graphs::graph::Node>>>::new();
+
+    macro_rules! display_span {
+        ($span:expr) => {{
+            format!(
+                "[{}, {}] - [{}, {}]",
+                $span.start.line + 1,
+                $span.start.column.utf8_offset,
+                $span.end.line + 1,
+                $span.end.column.utf8_offset
+            )
+        }};
+    }
 
     for node in source
         .graph
@@ -75,52 +87,30 @@ fn main() -> Result<()> {
             config,
             &stack_graphs::NoCancellation,
             |graph, _partials, partial| {
-                let start_span = &graph.source_info(partial.start_node).unwrap().span;
-                let end_span = &graph.source_info(partial.end_node).unwrap().span;
-                log::debug!(
-                    "reference: '{}' [{}:{}] - [{}:{}] -> [{}:{}] - [{}:{}]",
-                    &graph[graph[partial.start_node]
-                        .symbol()
-                        .expect("reference missing symbol")],
-                    start_span.start.line + 1,
-                    start_span.start.column.utf8_offset,
-                    start_span.end.line + 1,
-                    start_span.end.column.utf8_offset,
-                    end_span.start.line + 1,
-                    end_span.start.column.utf8_offset,
-                    end_span.end.line + 1,
-                    end_span.end.column.utf8_offset,
-                );
+                let start = display_span!(graph.source_info(partial.start_node).unwrap().span);
+                let end = display_span!(graph.source_info(partial.end_node).unwrap().span);
+                let symbol = &graph[graph[partial.start_node]
+                    .symbol()
+                    .expect("reference without symbol")];
+
+                log::debug!("reference: '{symbol}' {start} -> {end}",);
 
                 references
                     .entry(partial.end_node)
                     .or_insert_with(|| Vec::new())
                     .push(partial.start_node);
 
-                let info = graph
+                graph
                     .node_debug_info(partial.start_node)
-                    .expect("debug info");
-                info.iter().for_each(|entry| {
-                    log::trace!(
-                        "{:?} = {}",
-                        &source.graph[entry.key],
-                        &source.graph[entry.value]
-                    );
-                });
+                    .expect("debug info")
+                    .iter()
+                    .for_each(|entry| {
+                        let key = &source.graph[entry.key];
+                        let value = &source.graph[entry.value];
+                        log::trace!("{key:?} = {value}",);
+                    });
             },
         )?;
-    }
-
-    macro_rules! display_span {
-        ($span:expr) => {{
-            format!(
-                "[{}, {}] - [{}, {}]",
-                $span.start.line + 1,
-                $span.start.column.utf8_offset,
-                $span.end.line + 1,
-                $span.end.column.utf8_offset
-            )
-        }};
     }
 
     let symbol = source
@@ -174,16 +164,16 @@ fn main() -> Result<()> {
             })
     }
 
-    let mut needs_walk = vec![symbol];
+    let mut unvisited = vec![symbol];
     let mut visited: HashSet<SymbolBody> = HashSet::new();
-    while let Some(symbol) = needs_walk.pop() {
+    while let Some(symbol) = unvisited.pop() {
         let new: Vec<SymbolBody> = find_references_for_symbol(symbol, &source, &references)
             .into_iter()
             .filter(|symbol| !visited.contains(symbol))
             .inspect(|symbol| println!("{symbol:#?}"))
             .collect();
         visited.extend(new.clone());
-        needs_walk.extend(new);
+        unvisited.extend(new);
     }
 
     Ok(())
@@ -410,15 +400,15 @@ impl<'a> SourceCode<'a> {
                 | "expression_statement" => {}
                 "arrow_function" => parts.push(Anonymous("<fn>")),
                 "function_declaration" => capture!(Function)
-                    .context(format!("couldn't get name of function at {parent:?}",))?,
+                    .context(format!("couldn't get name of function at {parent:?}"))?,
                 "method_definition" => capture!(Method)
-                    .context(format!("couldn't get name of method at {parent:?}",))?,
+                    .context(format!("couldn't get name of method at {parent:?}"))?,
                 "class_declaration" => {
-                    capture!(Class).context(format!("couldn't get name of class at {parent:?}",))?
+                    capture!(Class).context(format!("couldn't get name of class at {parent:?}"))?
                 }
                 "interface_declaration" => capture!(Interface)
-                    .context(format!("couldn't get name of interface at {parent:?}",))?,
                 k => log::trace!("unrecognized node kind: {k}"),
+                    .context(format!("couldn't get name of interface at {parent:?}"))?,
             }
             match parent.parent() {
                 Some(p) => parent = p,
