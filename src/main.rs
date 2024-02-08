@@ -352,13 +352,14 @@ impl<'a> SourceCode<'a> {
                 | "arrow_function"
                 | "function_declaration"
                 | "method_definition" => break Some(node),
-                "call_expression" if self.export_name(node).is_some() => {
-                    return Ok(SymbolBody {
-                        identifier: self.find_ident(node.start_position()).unwrap_or(ident),
-                        body: node,
-                    });
+                _ => {
+                    if self.export_name(node).is_some() {
+                        return Ok(SymbolBody {
+                            identifier: self.find_ident(node.start_position()).unwrap_or(ident),
+                            body: node,
+                        });
+                    }
                 }
-                _ => {}
             }
             match node.parent() {
                 Some(parent) => node = parent,
@@ -375,6 +376,11 @@ impl<'a> SourceCode<'a> {
     }
 
     fn export_name(&'a self, node: tree_sitter::Node) -> Option<&'a str> {
+        match node.kind() {
+            "call_expression" | "assignment_expression" => {}
+            _ => return None,
+        }
+
         if let Some(expr) = node.child_by_field_name("function") {
             // XXX: this is fragile
             if expr.utf8_text(self.source.as_bytes()) == Ok("Object.defineProperty") {
@@ -403,7 +409,17 @@ impl<'a> SourceCode<'a> {
                     }
                 }
             }
+        } else if let Some(right) = node.child_by_field_name("left") {
+            if right.utf8_text(self.source.as_bytes()) == Ok("module.exports") {
+                return Some(
+                    node.child_by_field_name("right")
+                        .expect("assignment_expression with 'left' and no 'right'")
+                        .utf8_text(self.source.as_bytes())
+                        .expect("text for node"),
+                );
+            }
         }
+
         None
     }
 
@@ -465,12 +481,13 @@ impl<'a> SourceCode<'a> {
                 }
                 "interface_declaration" => capture!(Interface)
                     .context(format!("couldn't get name of interface at {parent:?}"))?,
-                "call_expression" => {
+                k => {
                     if let Some(name) = self.export_name(parent) {
-                        parts.push(Export(name));
+                        parts.push(Export(name))
+                    } else {
+                        log::trace!("unrecognized node ({parent:?}) kind '{k}'")
                     }
                 }
-                k => log::trace!("unrecognized node ({parent:?}) kind '{k}'"),
             }
             match parent.parent() {
                 Some(p) => parent = p,
