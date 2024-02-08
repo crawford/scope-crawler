@@ -1,13 +1,11 @@
 use anyhow::{Context, Result};
 use stack_graphs::arena::Handle;
-use stack_graphs::graph::NodeID;
 use stack_graphs::graph::StackGraph;
 use stack_graphs::partial::PartialPaths;
 use stack_graphs::stitching::GraphEdgeCandidates;
 use stack_graphs::stitching::StitcherConfig;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tree_sitter_stack_graphs::Variables;
@@ -17,6 +15,9 @@ struct Options {
     file: PathBuf,
     line: std::num::NonZeroUsize, // one-indexed
     column: Option<usize>,        // zero-indexed
+
+    #[arg(long = "add-files", short = 'a')]
+    additional_files: Vec<PathBuf>,
 
     #[arg(long = "timeout", short = 't', default_value = "5", value_parser = parse_duration)]
     timeout: Duration,
@@ -54,7 +55,10 @@ fn main() -> Result<()> {
     let options = Options::parse();
     init_logging(options.verbosity);
 
-    let source = SourceCode::from_path(&options.file)
+    let paths: Vec<&Path> = std::iter::once(options.file.as_path())
+        .chain(options.additional_files.iter().map(|path| path.as_path()))
+        .collect();
+    let sources = SourceCode::from_path(paths)
         .context(anyhow::anyhow!("reading {}", options.file.display()))?;
 
     let mut references =
@@ -72,6 +76,7 @@ fn main() -> Result<()> {
         }};
     }
 
+    let source = sources.first().expect("no sources");
     for node in source
         .graph
         .iter_nodes()
@@ -253,74 +258,86 @@ struct SourceCode<'a> {
 }
 
 impl<'a> SourceCode<'a> {
-    fn from_path(path: &'a Path) -> Result<SourceCode<'a>> {
+    fn from_path<P: IntoIterator<Item = &'a Path>>(paths: P) -> Result<Vec<SourceCode<'a>>> {
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(tree_sitter_typescript::language_typescript())
             .context("loading typescript grammar")?;
-        let source = std::fs::read_to_string(path).context("opening {path}")?;
-        let tree = parser.parse(&source, None).context("parsing source code")?;
 
-        let mut graph = StackGraph::new();
-        let globals = Variables::new();
-        let file = graph
-            .add_file(&path.to_string_lossy())
-            .expect("file not present in empty graph");
-        let language = tree_sitter_stack_graphs_typescript::try_language_configuration(
-            &tree_sitter_stack_graphs::NoCancellation,
-        )
-        .context("loading typescript TSG")?;
-        language
-            .sgl
-            .build_stack_graph_into(
-                &mut graph,
-                file,
-                &source,
-                &globals,
+        let mut sources = Vec::new();
+        for path in paths {
+            let source = std::fs::read_to_string(path).context("opening {path}")?;
+            let tree = parser.parse(&source, None).context("parsing source code")?;
+
+            let mut graph = StackGraph::new();
+            let globals = Variables::new();
+            let file = graph
+                .add_file(&path.to_string_lossy())
+                .expect("file not present in empty graph");
+            let language = tree_sitter_stack_graphs_typescript::try_language_configuration(
                 &tree_sitter_stack_graphs::NoCancellation,
             )
-            .context("building stack graph")?;
+            .context("loading typescript TSG")?;
+            language
+                .sgl
+                .build_stack_graph_into(
+                    &mut graph,
+                    file,
+                    &source,
+                    &globals,
+                    &tree_sitter_stack_graphs::NoCancellation,
+                )
+                .context("building stack graph")?;
 
-        // XXX: manually amend the graph to include a relationship between Square and Shape
-        // 222 - [syntax node new_expression(12, 6)] @gen_expr.applied_type
-        // 238 - [syntax node type_identifier(12, 22)] @type.type
-        // let specialization = graph.node_for_id(NodeID::new_in_file(file, 262)).unwrap();
-        // let generalization = graph.node_for_id(NodeID::new_in_file(file, 278)).unwrap();
-        // graph.add_edge(generalization, specialization, 0);
+            // XXX: manually amend the graph to include a relationship between Square and Shape
+            // 222 - [syntax node new_expression(12, 6)] @gen_expr.applied_type
+            // 238 - [syntax node type_identifier(12, 22)] @type.type
+            // use stack_graphs::graph::NodeID;
+            // let specialization = graph.node_for_id(NodeID::new_in_file(file, 262)).unwrap();
+            // let generalization = graph.node_for_id(NodeID::new_in_file(file, 278)).unwrap();
+            // graph.add_edge(generalization, specialization, 0);
 
-        let mut partials = PartialPaths::new();
-        let mut db = stack_graphs::stitching::Database::new();
+            #[cfg(feature = "write_graphs")]
+            {
+                use std::io::Write;
 
-        // Populate the database to get the paths in the visualization
-        let mut candidates = GraphEdgeCandidates::new(&graph, &mut partials, None);
-        stack_graphs::stitching::ForwardPartialPathStitcher::find_all_complete_partial_paths(
-            &mut candidates,
-            graph
-                .iter_nodes()
-                .filter(|n| graph[*n].is_reference())
-                .collect::<Vec<_>>(),
-            StitcherConfig::default(),
-            &stack_graphs::NoCancellation,
-            |g, ps, p| {
-                db.add_partial_path(g, ps, p.clone());
-            },
-        )?;
+                let mut partials = PartialPaths::new();
+                let mut db = stack_graphs::stitching::Database::new();
 
-        let contents = graph.to_html_string(
-            "test",
-            &mut partials,
-            &mut db,
-            &stack_graphs::serde::NoFilter,
-        )?;
-        let mut file = std::fs::File::create("graph.html").context("opening graph.html")?;
-        file.write_all(contents.as_bytes())?;
+                // Populate the database to get the paths in the visualization
+                let mut candidates = GraphEdgeCandidates::new(&graph, &mut partials, None);
+                stack_graphs::stitching::ForwardPartialPathStitcher::find_all_complete_partial_paths(
+                    &mut candidates,
+                    graph
+                        .iter_nodes()
+                        .filter(|n| graph[*n].is_reference())
+                        .collect::<Vec<_>>(),
+                    StitcherConfig::default(),
+                    &stack_graphs::NoCancellation,
+                    |g, ps, p| {
+                        db.add_partial_path(g, ps, p.clone());
+                    },
+                )?;
 
-        Ok(SourceCode {
-            path,
-            source,
-            tree,
-            graph,
-        })
+                let contents = graph.to_html_string(
+                    "test",
+                    &mut partials,
+                    &mut db,
+                    &stack_graphs::serde::NoFilter,
+                )?;
+                let mut file = std::fs::File::create("graph.html").context("opening graph.html")?;
+                file.write_all(contents.as_bytes())?;
+            }
+
+            sources.push(SourceCode {
+                path,
+                source,
+                tree,
+                graph,
+            });
+        }
+
+        Ok(sources)
     }
 
     // Finds the smallest enclosing scope of at interesting type.
