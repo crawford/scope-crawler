@@ -102,7 +102,7 @@ fn main() -> Result<()> {
 
                 references
                     .entry(partial.end_node)
-                    .or_insert_with(|| Vec::new())
+                    .or_default()
                     .push(partial.start_node);
 
                 graph
@@ -172,7 +172,7 @@ fn main() -> Result<()> {
     let mut unvisited = vec![symbol];
     let mut visited: HashSet<SymbolBody> = HashSet::new();
     while let Some(symbol) = unvisited.pop() {
-        let new: Vec<SymbolBody> = find_references_for_symbol(symbol, &source, &references)
+        let new: Vec<SymbolBody> = find_references_for_symbol(symbol, source, &references)
             .into_iter()
             .filter(|symbol| !visited.contains(symbol))
             .inspect(|symbol| println!("{symbol:#?}"))
@@ -368,7 +368,7 @@ impl<'a> SourceCode<'a> {
         .context("finding symbol body")?;
         let identifier = body
             .child_by_field_name("name")
-            .and_then(|node| Some(self.find_ident(node.start_position())))
+            .map(|node| self.find_ident(node.start_position()))
             .unwrap_or(Ok(ident))
             .context("finding symbol identifier")?;
         Ok(SymbolBody { identifier, body })
@@ -395,10 +395,11 @@ impl<'a> SourceCode<'a> {
 
                 if let (Some(subject), Some(name)) = (subject, name) {
                     if subject.utf8_text(self.source.as_bytes()) == Ok("exports") {
-                        return Some(name
-                            .utf8_text(self.source.as_bytes())
-                            .unwrap()
-                            .trim_matches('\''));
+                        return Some(
+                            name.utf8_text(self.source.as_bytes())
+                                .unwrap()
+                                .trim_matches('\''),
+                        );
                     }
                 }
             }
