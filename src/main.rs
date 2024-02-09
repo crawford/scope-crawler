@@ -77,14 +77,14 @@ fn main() -> Result<()> {
     let paths: Vec<&Path> = std::iter::once(options.file.as_path())
         .chain(options.additional_files.iter().map(|path| path.as_path()))
         .collect();
-    let sources = SourceCode::from_path(paths)
+    let source = SourceCode::from_path(paths)
         .context(anyhow::anyhow!("reading {}", options.file.display()))?;
 
-    let mut references =
-        HashMap::<Handle<stack_graphs::graph::Node>, Vec<Handle<stack_graphs::graph::Node>>>::new();
+    let mut references = HashMap::<
+        Handle<stack_graphs::graph::Node>,
+        HashSet<Handle<stack_graphs::graph::Node>>,
+    >::new();
 
-
-    let source = sources.first().expect("no sources");
     for node in source
         .graph
         .iter_nodes()
@@ -111,7 +111,7 @@ fn main() -> Result<()> {
                 references
                     .entry(partial.end_node)
                     .or_default()
-                    .push(partial.start_node);
+                    .insert(partial.start_node);
 
                 graph
                     .node_debug_info(partial.start_node)
@@ -126,7 +126,18 @@ fn main() -> Result<()> {
         )?;
     }
 
-    let symbol = source
+    references.iter().for_each(|(def, refs)| {
+        refs.iter().for_each(|r| {
+            log::trace!(
+                "{} <- {}",
+                display_sg_node!(*def, source.graph),
+                display_sg_node!(*r, source.graph)
+            )
+        });
+    });
+
+    let target = source.files.first().expect("no sources");
+    let symbol = target
         .symbol_at_point(tree_sitter::Point {
             row: options.line.get() - 1,
             column: options.column.unwrap_or(999),
@@ -140,7 +151,7 @@ fn main() -> Result<()> {
         source: &'a SourceCode,
         references: &HashMap<
             Handle<stack_graphs::graph::Node>,
-            Vec<Handle<stack_graphs::graph::Node>>,
+            HashSet<Handle<stack_graphs::graph::Node>>,
         >,
     ) -> HashSet<SymbolBody<'a>> {
         log::debug!("visiting: {symbol:#?}",);
@@ -165,6 +176,17 @@ fn main() -> Result<()> {
                                 );
                                 let ref_info = source.graph.source_info(*r#ref).unwrap();
 
+                                let file = source
+                                    .files
+                                    .iter()
+                                    .find(|file| {
+                                        source.graph[*r#ref]
+                                            .file()
+                                            .map(|f| Path::new(source.graph[f].name()))
+                                            .expect("file name")
+                                            == file.path
+                                    })
+                                    .expect("file for node");
                                 let symbol = file
                                     .symbol_at_point(ref_info.span.start.as_point())
                                     .unwrap();
@@ -183,7 +205,7 @@ fn main() -> Result<()> {
     let mut unvisited = vec![symbol];
     let mut visited: HashSet<SymbolBody> = HashSet::new();
     while let Some(symbol) = unvisited.pop() {
-        let new: Vec<SymbolBody> = find_references_for_symbol(symbol, source, &references)
+        let new: Vec<SymbolBody> = find_references_for_symbol(symbol, &source, &references)
             .into_iter()
             .filter(|symbol| !visited.contains(symbol))
             .inspect(|symbol| println!("{symbol:#?}"))
@@ -227,7 +249,7 @@ impl std::fmt::Display for IdentifierPart<'_> {
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct Identifier<'a> {
     node: tree_sitter::Node<'a>,
-    file: &'a Path,
+    file: &'a Path, // TODO: this is redundant
     parts: Vec<IdentifierPart<'a>>,
 }
 
@@ -261,131 +283,13 @@ impl std::fmt::Debug for Identifier<'_> {
     }
 }
 
-struct SourceCode<'a> {
+struct SourceCodeFile<'a> {
     path: &'a Path,
     source: String,
     tree: tree_sitter::Tree,
-    graph: StackGraph,
 }
 
-impl<'a> SourceCode<'a> {
-    fn from_path<P: IntoIterator<Item = &'a Path>>(paths: P) -> Result<Vec<SourceCode<'a>>> {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(tree_sitter_typescript::language_typescript())
-            .context("loading typescript grammar")?;
-
-        let mut sources = Vec::new();
-        for path in paths {
-            let source = std::fs::read_to_string(path).context("opening {path}")?;
-            let tree = parser.parse(&source, None).context("parsing source code")?;
-
-            let mut graph = StackGraph::new();
-            let globals = Variables::new();
-            let file = graph
-                .add_file(&path.to_string_lossy())
-                .expect("file not present in empty graph");
-            let language = tree_sitter_stack_graphs_typescript::try_language_configuration(
-                &tree_sitter_stack_graphs::NoCancellation,
-            )
-            .context("loading typescript TSG")?;
-            language
-                .sgl
-                .build_stack_graph_into(
-                    &mut graph,
-                    file,
-                    &source,
-                    &globals,
-                    &tree_sitter_stack_graphs::NoCancellation,
-                )
-                .context("building stack graph")?;
-
-            // XXX: manually amend the graph to include a relationship between Square and Shape
-            // 222 - [syntax node new_expression(12, 6)] @gen_expr.applied_type
-            // 238 - [syntax node type_identifier(12, 22)] @type.type
-            // use stack_graphs::graph::NodeID;
-            // let specialization = graph.node_for_id(NodeID::new_in_file(file, 262)).unwrap();
-            // let generalization = graph.node_for_id(NodeID::new_in_file(file, 278)).unwrap();
-            // graph.add_edge(generalization, specialization, 0);
-
-            #[cfg(feature = "write_graphs")]
-            {
-                use std::io::Write;
-
-                let mut partials = PartialPaths::new();
-                let mut db = stack_graphs::stitching::Database::new();
-
-                // Populate the database to get the paths in the visualization
-                let mut candidates = GraphEdgeCandidates::new(&graph, &mut partials, None);
-                stack_graphs::stitching::ForwardPartialPathStitcher::find_all_complete_partial_paths(
-                    &mut candidates,
-                    graph
-                        .iter_nodes()
-                        .filter(|n| graph[*n].is_reference())
-                        .collect::<Vec<_>>(),
-                    StitcherConfig::default(),
-                    &stack_graphs::NoCancellation,
-                    |g, ps, p| {
-                        db.add_partial_path(g, ps, p.clone());
-                    },
-                )?;
-
-                let contents = graph.to_html_string(
-                    "test",
-                    &mut partials,
-                    &mut db,
-                    &stack_graphs::serde::NoFilter,
-                )?;
-                let mut file = std::fs::File::create("graph.html").context("opening graph.html")?;
-                file.write_all(contents.as_bytes())?;
-            }
-
-            sources.push(SourceCode {
-                path,
-                source,
-                tree,
-                graph,
-            });
-        }
-
-        Ok(sources)
-    }
-
-    // Finds the smallest enclosing scope of at interesting type.
-    fn symbol_at_point(&'a self, point: tree_sitter::Point) -> Result<SymbolBody<'a>> {
-        let ident = self.find_ident(point)?;
-        let mut node = ident.node;
-        let body = loop {
-            match node.kind() {
-                "program"
-                | "class_declaration"
-                | "interface_declaration"
-                | "arrow_function"
-                | "function_declaration"
-                | "method_definition" => break Some(node),
-                _ => {
-                    if self.export_name(node).is_some() {
-                        return Ok(SymbolBody {
-                            identifier: self.find_ident(node.start_position()).unwrap_or(ident),
-                            body: node,
-                        });
-                    }
-                }
-            }
-            match node.parent() {
-                Some(parent) => node = parent,
-                None => break Some(node),
-            }
-        }
-        .context("finding symbol body")?;
-        let identifier = body
-            .child_by_field_name("name")
-            .map(|node| self.find_ident(node.start_position()))
-            .unwrap_or(Ok(ident))
-            .context("finding symbol identifier")?;
-        Ok(SymbolBody { identifier, body })
-    }
-
+impl<'a> SourceCodeFile<'a> {
     fn export_name(&'a self, node: tree_sitter::Node) -> Option<&'a str> {
         match node.kind() {
             "call_expression" | "assignment_expression" => {}
@@ -440,8 +344,6 @@ impl<'a> SourceCode<'a> {
             .root_node()
             .descendant_for_point_range(point, point)
             .context("finding descendant at point")?;
-
-        // self.log_tree(node);
 
         macro_rules! field {
             ($node:ident, $name:literal) => {{
@@ -508,5 +410,124 @@ impl<'a> SourceCode<'a> {
 
         let file = self.path;
         Ok(Identifier { node, file, parts })
+    }
+
+    // Finds the smallest enclosing scope of at interesting type.
+    fn symbol_at_point(&'a self, point: tree_sitter::Point) -> Result<SymbolBody<'a>> {
+        let ident = self.find_ident(point)?;
+        let mut node = ident.node;
+        let body = loop {
+            match node.kind() {
+                "program"
+                | "class_declaration"
+                | "interface_declaration"
+                | "arrow_function"
+                | "function_declaration"
+                | "method_definition" => break Some(node),
+                _ => {
+                    if self.export_name(node).is_some() {
+                        return Ok(SymbolBody {
+                            identifier: self.find_ident(node.start_position()).unwrap_or(ident),
+                            body: node,
+                        });
+                    }
+                }
+            }
+            match node.parent() {
+                Some(parent) => node = parent,
+                None => break Some(node),
+            }
+        }
+        .context("finding symbol body")?;
+        let identifier = body
+            .child_by_field_name("name")
+            .map(|node| self.find_ident(node.start_position()))
+            .unwrap_or(Ok(ident))
+            .context("finding symbol identifier")?;
+        Ok(SymbolBody { identifier, body })
+    }
+}
+
+struct SourceCode<'a> {
+    graph: StackGraph,
+    files: Vec<SourceCodeFile<'a>>,
+}
+
+impl<'a> SourceCode<'a> {
+    fn from_path<P: IntoIterator<Item = &'a Path>>(paths: P) -> Result<SourceCode<'a>> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(tree_sitter_typescript::language_typescript())
+            .context("loading typescript grammar")?;
+
+        let mut graph = StackGraph::new();
+        let globals = Variables::new();
+        let mut files = Vec::new();
+        for path in paths {
+            let source = std::fs::read_to_string(path).context("opening {path}")?;
+            let tree = parser.parse(&source, None).context("parsing source code")?;
+
+            let file = graph
+                .add_file(&path.to_string_lossy())
+                .expect("file not present in empty graph");
+            let language = tree_sitter_stack_graphs_typescript::try_language_configuration(
+                &tree_sitter_stack_graphs::NoCancellation,
+            )
+            .context("loading typescript TSG")?;
+            language
+                .sgl
+                .build_stack_graph_into(
+                    &mut graph,
+                    file,
+                    &source,
+                    &globals,
+                    &tree_sitter_stack_graphs::NoCancellation,
+                )
+                .context("building stack graph")?;
+
+            // XXX: manually amend the graph to include a relationship between Square and Shape
+            // 222 - [syntax node new_expression(12, 6)] @gen_expr.applied_type
+            // 238 - [syntax node type_identifier(12, 22)] @type.type
+            // use stack_graphs::graph::NodeID;
+            // let specialization = graph.node_for_id(NodeID::new_in_file(file, 262)).unwrap();
+            // let generalization = graph.node_for_id(NodeID::new_in_file(file, 278)).unwrap();
+            // graph.add_edge(generalization, specialization, 0);
+
+            files.push(SourceCodeFile { path, source, tree });
+        }
+
+        #[cfg(feature = "write_graphs")]
+        {
+            use std::io::Write;
+
+            let mut partials = PartialPaths::new();
+            let mut db = stack_graphs::stitching::Database::new();
+
+            // Populate the database to get the paths in the visualization
+            let mut candidates = GraphEdgeCandidates::new(&graph, &mut partials, None);
+            stack_graphs::stitching::ForwardPartialPathStitcher::find_all_complete_partial_paths(
+                &mut candidates,
+                graph
+                    .iter_nodes()
+                    .filter(|n| graph[*n].is_reference())
+                    .collect::<Vec<_>>(),
+                StitcherConfig::default(),
+                &stack_graphs::NoCancellation,
+                |g, ps, p| {
+                    db.add_partial_path(g, ps, p.clone());
+                },
+            )?;
+
+            let contents = graph.to_html_string(
+                "test",
+                &mut partials,
+                &mut db,
+                &stack_graphs::serde::NoFilter,
+            )?;
+            let mut file = std::fs::File::create("graph.html").context("opening graph.html")?;
+            file.write_all(contents.as_bytes())?;
+        }
+
+        Ok(SourceCode { graph, files })
     }
 }
