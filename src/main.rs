@@ -49,6 +49,25 @@ fn init_logging(verbosity: u8) {
         .expect("initializing logging");
 }
 
+macro_rules! display_sg_node {
+    ($node:expr, $graph:expr) => {{
+        let file = $graph[$node]
+            .file()
+            .map(|file| $graph[file].name())
+            .unwrap_or("<unknown path>");
+        let span = &$graph.source_info($node).unwrap().span;
+        let location = format!(
+            "[{}, {}] - [{}, {}]",
+            span.start.line + 1,
+            span.start.column.utf8_offset,
+            span.end.line + 1,
+            span.end.column.utf8_offset
+        );
+
+        format!("{{{file}, {location}}}")
+    }};
+}
+
 fn main() -> Result<()> {
     use clap::Parser;
 
@@ -64,17 +83,6 @@ fn main() -> Result<()> {
     let mut references =
         HashMap::<Handle<stack_graphs::graph::Node>, Vec<Handle<stack_graphs::graph::Node>>>::new();
 
-    macro_rules! display_span {
-        ($span:expr) => {{
-            format!(
-                "[{}, {}] - [{}, {}]",
-                $span.start.line + 1,
-                $span.start.column.utf8_offset,
-                $span.end.line + 1,
-                $span.end.column.utf8_offset
-            )
-        }};
-    }
 
     let source = sources.first().expect("no sources");
     for node in source
@@ -92,12 +100,12 @@ fn main() -> Result<()> {
             config,
             &stack_graphs::NoCancellation,
             |graph, _partials, partial| {
-                let start = display_span!(graph.source_info(partial.start_node).unwrap().span);
-                let end = display_span!(graph.source_info(partial.end_node).unwrap().span);
                 let symbol = &graph[graph[partial.start_node]
                     .symbol()
                     .expect("reference without symbol")];
 
+                let start = display_sg_node!(partial.start_node, graph);
+                let end = display_sg_node!(partial.end_node, graph);
                 log::debug!("reference: '{symbol}' {start} -> {end}",);
 
                 references
@@ -138,25 +146,28 @@ fn main() -> Result<()> {
         log::debug!("visiting: {symbol:#?}",);
         references
             .iter()
-            .map(|(def, refs)| (source.graph.source_info(*def).unwrap(), refs))
             .fold(HashSet::new(), |symbols, (def, refs)| {
+                let def_info = source.graph.source_info(*def).unwrap();
                 match symbol.body.child_by_field_name("name") {
                     Some(node)
-                        if def.span.start == node.start_position()
-                            && def.span.end == node.end_position() =>
+                        if def_info.span.start == node.start_position()
+                            && def_info.span.end == node.end_position() =>
                     {
                         log::trace!("enclosing body {}", format!("{:?}", symbol.body));
 
-                        refs.iter()
-                            .map(|r| source.graph.source_info(*r).unwrap())
+                        refs
+                            .iter()
                             .fold(symbols, |mut symbols, r#ref| {
                                 log::debug!(
                                     "considering definition: {} <- {}",
-                                    display_span!(def.span),
-                                    display_span!(r#ref.span),
+                                    display_sg_node!(*def, source.graph),
+                                    display_sg_node!(*r#ref, source.graph),
                                 );
-                                let symbol =
-                                    source.symbol_at_point(r#ref.span.start.as_point()).unwrap();
+                                let ref_info = source.graph.source_info(*r#ref).unwrap();
+
+                                let symbol = file
+                                    .symbol_at_point(ref_info.span.start.as_point())
+                                    .unwrap();
 
                                 log::debug!("found: {symbol:#?}",);
                                 symbols.insert(symbol);
